@@ -30,8 +30,10 @@ internal class PotholeVerification(private val owner: String) {
     private var nextAttempt = 0L
     private var refreshSession = false
 
+    fun canAttempt(): Boolean = SystemClock.elapsedRealtime() >= nextAttempt
+
     fun verify(frame: Bitmap, boxes: List<Detection>): List<Verdict> {
-        if (boxes.isEmpty() || SystemClock.elapsedRealtime() < nextAttempt) return emptyList()
+        if (boxes.isEmpty() || !canAttempt()) return emptyList()
         val client = RoadWatchBackend.client ?: return emptyList()
         if (client.auth.currentUserOrNull()?.id != owner) return emptyList()
 
@@ -133,4 +135,17 @@ internal fun detectionSummary(confirmed: Int, unverified: Int): String = when {
     confirmed == 0 -> "Possible pothole · unverified"
     unverified == 0 -> "Gemini confirmed $confirmed"
     else -> "Gemini confirmed $confirmed · $unverified unverified"
+}
+
+internal fun liveVerificationSummary(verdicts: List<Verdict>): String {
+    if (verdicts.isEmpty()) return "Gemini verification unavailable"
+    val results = Verdict.entries.mapNotNull { verdict ->
+        val count = verdicts.count { it == verdict }
+        if (count == 0) null else when (verdict) {
+            Verdict.CONFIRMED -> "confirmed $count"
+            Verdict.REJECTED -> "rejected $count"
+            Verdict.UNCERTAIN -> "unsure about $count"
+        }
+    }
+    return results.joinToString(separator = " · ", prefix = "Gemini ")
 }

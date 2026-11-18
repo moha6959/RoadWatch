@@ -4,17 +4,23 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.RectF
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
@@ -53,6 +59,8 @@ fun ScanScreen(owner: String, onFinished: () -> Unit) {
     var latency by remember { mutableLongStateOf(0L) }
     var message by remember { mutableStateOf("Loading pothole detector…") }
     var verificationMessage by remember { mutableStateOf<String?>(null) }
+    var candidates by remember { mutableStateOf<List<RectF>>(emptyList(), referentialEqualityPolicy()) }
+    var candidateCount by remember { mutableIntStateOf(0) }
     var count by remember { mutableIntStateOf(0) }
     var stopping by remember { mutableStateOf(false) }
     var stop by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -66,11 +74,31 @@ fun ScanScreen(owner: String, onFinished: () -> Unit) {
         if(permission && !stopping && !paused) while(true) { delay(1000); elapsed++ }
     }
     val preview = remember { PreviewView(context).apply { scaleType=PreviewView.ScaleType.FILL_CENTER } }
+    LaunchedEffect(candidates) {
+        if (candidates.isNotEmpty()) {
+            delay(2_500)
+            candidates = emptyList()
+            candidateCount = 0
+        }
+    }
     BackHandler { if(!stopping) { if(stop != null) { stopping=true; stop?.invoke() } else onFinished() } }
     BoxWithConstraints(Modifier.fillMaxSize().background(Color(0xFF101813))) {
         val compact=maxHeight<500.dp
         if(permission) AndroidView(factory={preview},modifier=Modifier.fillMaxSize())
         Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Black.copy(alpha=.55f),Color.Transparent,Color.Transparent,Color.Black.copy(alpha=.6f)))))
+        if (!paused && !stopping && candidates.isNotEmpty()) {
+            Canvas(Modifier.fillMaxSize().clipToBounds()) {
+                val sensorToPreview = preview.sensorToViewTransform ?: return@Canvas
+                for (candidate in candidates) {
+                    val box = RectF(candidate)
+                    sensorToPreview.mapRect(box)
+                    val topLeft = Offset(box.left, box.top)
+                    val boxSize = Size(box.width(), box.height())
+                    drawRect(Color.Black, topLeft, boxSize, style = Stroke(width = 5.dp.toPx()))
+                    drawRect(Color(0xFFFFC76F), topLeft, boxSize, style = Stroke(width = 2.dp.toPx()))
+                }
+            }
+        }
         Row(Modifier.align(Alignment.TopCenter).fillMaxWidth().statusBarsPadding().padding(20.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.SpaceBetween) {
             JourneyButton("End scan and review","back",{ if(!stopping) { if(stop!=null) { stopping=true;stop?.invoke() } else onFinished() } },enabled=!stopping,dark=true)
             JourneyPill(if(!permission) "ROAD SCAN" else if(stopping) "SAVING" else if(paused) "PAUSED" else "%02d:%02d · SCANNING".format(elapsed/60,elapsed%60),dark=true,indicator=if(paused) Color(0xFFFFC76F) else if(permission) Color(0xFFA9DFB8) else null)
@@ -86,7 +114,14 @@ fun ScanScreen(owner: String, onFinished: () -> Unit) {
                     Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(if(paused) "Scan paused" else "Watching the road",fontSize=20.sp,fontWeight=FontWeight.SemiBold)
-                            Text(if(message.startsWith("Scanning paused") || message.startsWith("Camera unavailable")) message else if(count>0) "Possible potholes saved for review" else if(latency==0L) "Connecting camera…" else "Looking for possible potholes",fontSize=13.sp,color=Color(0xFFB9C8BD))
+                            val detectorStatus = when {
+                                paused -> message
+                                candidateCount == 1 -> "YOLO detected a possible pothole"
+                                candidateCount > 1 -> "YOLO detected $candidateCount possible potholes"
+                                latency == 0L -> "Connecting camera…"
+                                else -> "YOLO is looking for potholes"
+                            }
+                            Text(detectorStatus, fontSize = 13.sp, color = Color(0xFFB9C8BD))
                         }
                         Column(horizontalAlignment=Alignment.End) {
                             Text("$count",fontSize=28.sp,fontWeight=FontWeight.SemiBold)
@@ -159,12 +194,20 @@ fun ScanScreen(owner: String, onFinished: () -> Unit) {
                                 val started=android.os.SystemClock.elapsedRealtime()
                                 val boxes=detector!!.detect(bitmap)
                                 val elapsed=android.os.SystemClock.elapsedRealtime()-started
-                                main.execute { latency=elapsed }
-                                if(boxes.isNotEmpty()) {
-                                    val confirmed = confirmedDetections(boxes, verifier.verify(bitmap, boxes))
-                                    if (confirmed.isEmpty()) {
-                                        main.execute { verificationMessage = "Candidate discarded · no Gemini confirmation" }
-                                    } else {
+                                val regions = sensorRegions(image, matrix, bitmap, boxes)
+                                val checking = boxes.isNotEmpty() && verifier.canAttempt()
+                                main.execute {
+                                    if (active.get()) {
+                                        latency = elapsed
+                                        candidates = regions
+                                        candidateCount = boxes.size
+                                        if (checking) verificationMessage = "Gemini is checking…"
+                                    }
+                                }
+                                if (checking) {
+                                    val verdicts = verifier.verify(bitmap, boxes)
+                                    val confirmed = confirmedDetections(boxes, verdicts)
+                                    if (confirmed.isNotEmpty()) {
                                         val bytes = ByteArrayOutputStream().use {
                                             check(bitmap.compress(Bitmap.CompressFormat.JPEG, 85, it))
                                             it.toByteArray()
@@ -174,12 +217,14 @@ fun ScanScreen(owner: String, onFinished: () -> Unit) {
                                             savedBoxes.put(box.json().put("verification", "confirmed"))
                                         }
                                         store.addCapture(reportId!!, bytes, savedBoxes, location)
-                                        main.execute {
-                                            count++
-                                            verificationMessage = "Gemini confirmed ${confirmed.size}"
+                                    }
+                                    main.execute {
+                                        if (active.get()) {
+                                            if (confirmed.isNotEmpty()) count++
+                                            verificationMessage = "Last check · ${liveVerificationSummary(verdicts)}"
                                         }
                                     }
-                                } else main.execute { message="Scanning · no pothole in the latest frame" }
+                                }
                             } finally { if(bitmap!==raw) bitmap.recycle(); raw.recycle() }
                         }
                     } catch(e: Exception) {
@@ -192,5 +237,34 @@ fun ScanScreen(owner: String, onFinished: () -> Unit) {
             } catch(e: Exception) { message="Camera unavailable. Stop to return to your reports." }
         },main)
         onDispose { lifecycle.lifecycle.removeObserver(observer); stop=null; finish(false) }
+    }
+}
+
+private fun sensorRegions(
+    image: ImageProxy,
+    rotation: Matrix,
+    bitmap: Bitmap,
+    boxes: List<Detection>
+): List<RectF> {
+    if (boxes.isEmpty()) return emptyList()
+    val rotatedBounds = RectF(0f, 0f, image.width.toFloat(), image.height.toFloat())
+    rotation.mapRect(rotatedBounds)
+    // Bitmap.createBitmap shifts the rotated image back to a zero-based origin.
+    val bufferToBitmap = Matrix(rotation).apply {
+        postTranslate(-rotatedBounds.left, -rotatedBounds.top)
+    }
+    val sensorToBitmap = Matrix().apply {
+        setConcat(bufferToBitmap, image.imageInfo.sensorToBufferTransformMatrix)
+    }
+    val bitmapToSensor = Matrix()
+    if (!sensorToBitmap.invert(bitmapToSensor)) return emptyList()
+
+    return boxes.map { box ->
+        RectF(
+            box.x * bitmap.width,
+            box.y * bitmap.height,
+            (box.x + box.width) * bitmap.width,
+            (box.y + box.height) * bitmap.height
+        ).apply { bitmapToSensor.mapRect(this) }
     }
 }
